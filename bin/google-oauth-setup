@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# google-oauth-setup — sets up Google OAuth 2.0 for a web app, end-to-end
+#
+# Automates every part that CAN be automated (cookie import, DOM scraping,
+# Vercel env var set without trailing newlines) and gives a tight runbook
+# for the two Google Cloud Console steps that require a human click.
+#
+# Usage:
+#   google-oauth-setup --app-name "Loop" \
+#                      --redirect-uri "https://loop.oddgroup.ai/api/auth/google/callback" \
+#                      --project-id my-gcp-project-id \
+#                      [--vercel-project loop-pm-agent] \
+#                      [--env-prefix GOOGLE]
+#
+# Prereqs:
+#   - gstack browse (brew install gstack, or ~/.claude/skills/gstack/browse)
+#   - cookie-import-browser (ships with gstack)
+#   - vercel CLI (npm i -g vercel) — only needed with --vercel-project
+#   - jq
+#   - Chrome installed with a Google session active
+#
+# This script exists because I lost ~2 hours to three gotchas:
+#   A) Chrome cookies need the `.google.com` dot-prefix, not `google.com`
+#   B) Client secret is hidden after Google shows it — must be scraped from
+#      the DOM on the creation success modal
+#   C) `echo "$VAL" | vercel env add` appends \n → Google rejects OAuth
+#      with "The OAuth client was not found." Use `printf` instead.
+#   D) IAP OAuth Admin API was shut down March 2026; no gcloud path exists
+#      for creating OAuth 2.0 Web clients. Browser is the only way.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$SCRIPT_DIR/../lib"
+
+# ─── arg parsing ──────────────────────────────────────────────────────────
+APP_NAME=""
+REDIRECT_URI=""
+PROJECT_ID=""
+VERCEL_PROJECT=""
+ENV_PREFIX="GOOGLE"
+
+usage() {
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --app-name)        APP_NAME="$2"; shift 2 ;;
+    --redirect-uri)    REDIRECT_URI="$2"; shift 2 ;;
+    --project-id)      PROJECT_ID="$2"; shift 2 ;;
+    --vercel-project)  VERCEL_PROJECT="$2"; shift 2 ;;
+    --env-prefix)      ENV_PREFIX="$2"; shift 2 ;;
+    -h|--help)         usage ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "$APP_NAME" || -z "$REDIRECT_URI" || -z "$PROJECT_ID" ]]; then
+  echo "missing required flags. See --help." >&2
+  exit 2
+fi
+
+# ─── pretty output ────────────────────────────────────────────────────────
+BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'
+YELLOW=$'\033[33m'; RED=$'\033[31m'; RESET=$'\033[0m'
+
+step() { echo; echo "${BOLD}▶ $*${RESET}"; }
+ok()   { echo "${GREEN}✓${RESET} $*"; }
+warn() { echo "${YELLOW}!${RESET} $*"; }
+err()  { echo "${RED}✗${RESET} $*" >&2; }
+note() { echo "${DIM}  $*${RESET}"; }
+
+# ─── find browse binary ───────────────────────────────────────────────────
+BROWSE=""
+for candidate in \
+  "$HOME/.claude/skills/gstack/browse/dist/browse" \
+  "$(command -v browse 2>/dev/null)"; do
+  [[ -n "$candidate" && -x "$candidate" ]] && { BROWSE="$candidate"; break; }
+done
+if [[ -z "$BROWSE" ]]; then
+  err "gstack browse not found. Install: https://github.com/garry-tan/gstack"
+  exit 1
+fi
+
+COOKIE_IMPORT="$(dirname "$BROWSE")/../../cookie-import-browser"
+if [[ ! -x "$COOKIE_IMPORT" ]]; then
+  COOKIE_IMPORT="$(command -v cookie-import-browser 2>/dev/null || true)"
+fi
+
+command -v jq >/dev/null || { err "jq required"; exit 1; }
+
+# ─── step 1: import Google cookies (GOTCHA A: dot-prefix) ────────────────
+step "1/5 · Importing Google cookies from Chrome"
+
+if [[ -n "$COOKIE_IMPORT" ]]; then
+  # Without the dot prefix, only exact `google.com` cookies come through
+  # (usually 0 results). `.google.com` grabs all subdomain cookies.
+  note "using --domain .google.com (with dot prefix, the critical fix)"
+  if "$COOKIE_IMPORT" chrome --domain .google.com 2>&1 | tail -3; then
+    ok "cookies imported"
+  else
+    warn "cookie import failed — you may need to close Chrome first"
+    warn "or run manually: $COOKIE_IMPORT chrome --domain .google.com"
+  fi
+else
+  warn "cookie-import-browser not found; skipping auto-import"
+  note "manually import with: cookie-import-browser chrome --domain .google.com"
+fi
+
+# ─── step 2: open GCP Credentials page ────────────────────────────────────
+step "2/5 · Opening Google Cloud Console Credentials page"
+
+CREDENTIALS_URL="https://console.cloud.google.com/apis/credentials?project=${PROJECT_ID}"
+"$BROWSE" goto "$CREDENTIALS_URL" >/dev/null 2>&1 || true
+sleep 2
+
+PAGE_TEXT="$("$BROWSE" text 2>/dev/null | head -100 || true)"
+if echo "$PAGE_TEXT" | grep -qiE "sign in|continue to google"; then
+  err "Google is showing a sign-in page — your Chrome cookies didn't carry an active session."
+  note "Fix: open Chrome, sign in to Google, then re-run this tool."
+  exit 1
+fi
+if echo "$PAGE_TEXT" | grep -qE "500|error"; then
+  warn "Google Cloud Console returned an error — bot detection, possibly."
+  note "Open $CREDENTIALS_URL in your real Chrome window, complete any challenge, and retry."
+fi
+
+ok "Credentials page loaded"
+note "URL: $CREDENTIALS_URL"
+
+# ─── step 3: human step — create OAuth 2.0 Web client ────────────────────
+step "3/5 · RUNBOOK · Create OAuth 2.0 Web client (needs clicks)"
+
+cat <<EOF
+${DIM}Why manual: Google shut down the IAP OAuth Admin API on 2026-03-19.
+No gcloud / SDK path exists. Must be done in the browser.${RESET}
+
+Do this on the browser page now:
+
+  1. If you haven't set up an OAuth consent screen:
+     — Click "OAuth consent screen" in the left nav
+     — User type: External · App name: ${BOLD}${APP_NAME}${RESET}
+     — Support email: your email
+     — Scopes: leave empty (we use openid/email/profile which are defaults)
+     — Save, then return to Credentials
+
+  2. Click "+ CREATE CREDENTIALS" → "OAuth client ID"
+  3. Application type: ${BOLD}Web application${RESET}
+  4. Name: ${BOLD}${APP_NAME}${RESET}
+  5. Authorized redirect URIs: add
+     ${BOLD}${REDIRECT_URI}${RESET}
+  6. Click CREATE
+
+Google will show a modal with the Client ID visible and the Client Secret
+half-hidden. ${BOLD}Do not close the modal${RESET}. Press Enter here when the
+modal is showing.
+EOF
+
+read -r -p "  [press Enter when the success modal is open] "
+
+# ─── step 4: scrape client ID + secret from DOM ──────────────────────────
+step "4/5 · Scraping Client ID and Client Secret from the DOM"
+
+# GOTCHA B: Google shows the secret once in a modal, then masks it.
+# The secret is present in the DOM as plain text at modal-show time.
+# Regex: GOCSPX- is Google's fixed prefix for OAuth 2.0 client secrets.
+SCRAPE_JS='(() => {
+  const html = document.documentElement.outerHTML;
+  const ids = [...new Set((html.match(/[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com/g) || []))];
+  const secrets = [...new Set((html.match(/GOCSPX-[A-Za-z0-9_-]+/g) || []))];
+  return JSON.stringify({ids, secrets});
+})()'
+
+SCRAPE_OUT="$("$BROWSE" js "$SCRAPE_JS" 2>/dev/null || echo '{}')"
+# browse js returns the raw return value — may be wrapped in quotes
+SCRAPE_JSON="$(echo "$SCRAPE_OUT" | jq -r '.' 2>/dev/null || echo "$SCRAPE_OUT")"
+
+CLIENT_ID="$(echo "$SCRAPE_JSON" | jq -r '.ids[0] // empty' 2>/dev/null || true)"
+CLIENT_SECRET="$(echo "$SCRAPE_JSON" | jq -r '.secrets[0] // empty' 2>/dev/null || true)"
+
+if [[ -z "$CLIENT_ID" || -z "$CLIENT_SECRET" ]]; then
+  err "couldn't scrape credentials. The DOM didn't contain the expected patterns."
+  note "Possible causes:"
+  note "  — the success modal was closed before scrape"
+  note "  — Google changed the secret format (last known: GOCSPX-...)"
+  note "Fallback: paste them manually."
+  read -r -p "  Client ID: " CLIENT_ID
+  read -r -s -p "  Client Secret: " CLIENT_SECRET; echo
+fi
+
+ok "Client ID:     ${CLIENT_ID}"
+ok "Client Secret: ${CLIENT_SECRET:0:12}... (${#CLIENT_SECRET} chars)"
+
+# ─── step 5: set Vercel env vars (GOTCHA C: printf not echo) ─────────────
+step "5/5 · Setting Vercel env vars"
+
+if [[ -n "$VERCEL_PROJECT" ]]; then
+  command -v vercel >/dev/null || { err "vercel CLI not found"; exit 1; }
+  ID_KEY="${ENV_PREFIX}_CLIENT_ID"
+  SECRET_KEY="${ENV_PREFIX}_CLIENT_SECRET"
+
+  # Remove first so we can re-set without conflict (idempotent).
+  for key in "$ID_KEY" "$SECRET_KEY"; do
+    for env in production preview development; do
+      vercel env rm "$key" "$env" --yes --project "$VERCEL_PROJECT" >/dev/null 2>&1 || true
+    done
+  done
+
+  # GOTCHA C: piping via `echo` adds a trailing newline. Google rejects
+  # OAuth with "The OAuth client was not found" because the client_id
+  # becomes "420930943775-...\n". Use printf to send exact bytes.
+  for env in production preview development; do
+    printf '%s' "$CLIENT_ID"     | vercel env add "$ID_KEY"     "$env" --project "$VERCEL_PROJECT" >/dev/null
+    printf '%s' "$CLIENT_SECRET" | vercel env add "$SECRET_KEY" "$env" --project "$VERCEL_PROJECT" >/dev/null
+  done
+  ok "set $ID_KEY and $SECRET_KEY across prod/preview/dev on $VERCEL_PROJECT"
+  note "redeploy to pick them up: vercel --prod"
+else
+  cat <<EOF
+  No --vercel-project given. Copy-paste these exactly:
+
+    ${BOLD}export ${ENV_PREFIX}_CLIENT_ID=$(printf '%s' "$CLIENT_ID")
+    export ${ENV_PREFIX}_CLIENT_SECRET=$(printf '%s' "$CLIENT_SECRET")${RESET}
+
+  If setting in Vercel manually, ${BOLD}pipe via printf, not echo${RESET}:
+    printf '%s' "\$${ENV_PREFIX}_CLIENT_ID" | vercel env add ${ENV_PREFIX}_CLIENT_ID production
+EOF
+fi
+
+echo
+ok "Done. Test with: curl -I \"${REDIRECT_URI%/callback}\""
