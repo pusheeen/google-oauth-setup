@@ -23,10 +23,10 @@ This script knows all four.
 ## Install
 
 ```bash
-git clone https://github.com/pusheeen/tools ~/pusheeen-tools
-chmod +x ~/pusheeen-tools/google-oauth-setup/bin/google-oauth-setup
+git clone https://github.com/maggiemchen/tools ~/maggiemchen-tools
+chmod +x ~/maggiemchen-tools/google-oauth-setup/bin/google-oauth-setup
 # optional: symlink onto PATH
-ln -s ~/pusheeen-tools/google-oauth-setup/bin/google-oauth-setup ~/.local/bin/
+ln -s ~/maggiemchen-tools/google-oauth-setup/bin/google-oauth-setup ~/.local/bin/
 ```
 
 ## Prereqs
